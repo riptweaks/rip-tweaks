@@ -1,0 +1,97 @@
+name: Release notes
+
+# Every hour (and from the Actions tab): a GitHub release for each new
+# RIP Tweaks version, with its patch notes from riptweaks.com/changelog/,
+# once that version is live in the app.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: release-notes
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Post new versions
+        run: |
+          node --input-type=module <<'EOF'
+          import { execFileSync } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+
+          const SITE = 'https://riptweaks.com';
+          const FIRST = '6.6'; // the first version in this repository
+
+          const num = (v) => v.replace(/^v/, '').split('.').map(Number);
+          const cmp = (a, b) => {
+            const x = num(a), y = num(b);
+            for (let i = 0; i < Math.max(x.length, y.length); i++) {
+              if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+            }
+            return 0;
+          };
+          const get = async (url) => {
+            const res = await fetch(url, {
+              headers: { 'user-agent': 'rip-tweaks-release-notes (+https://github.com/riptweaks/rip-tweaks)' },
+              signal: AbortSignal.timeout(30000),
+            });
+            if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+            return res.text();
+          };
+
+          // The patch notes card (h3, p, ul/li) as Markdown.
+          const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“', ndash: '–', mdash: '—', hellip: '…' };
+          const decode = (s) => s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => e[0] !== '#' ? NAMED[e.toLowerCase()] ?? m
+            : String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1))));
+          const inline = (s) => decode(s
+            .replace(/<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+            .replace(/<\/?(strong|b)\b[^>]*>/gi, '**')
+            .replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+          const notes = (html, v) => {
+            const card = html.match(/<div class="rt-cl-notes">([\s\S]*?)<\/div>/);
+            if (!card) throw new Error(`no patch notes on ${SITE}/changelog/rip/${v}/`);
+            const out = [];
+            for (const m of card[1].matchAll(/<h3[^>]*>([\s\S]*?)<\/h3>|<p[^>]*>([\s\S]*?)<\/p>|<li[^>]*>([\s\S]*?)<\/li>/gi)) {
+              if (m[3] !== undefined) { out.push(`- ${inline(m[3])}`); continue; }
+              if (out.length) out.push('');
+              out.push(m[1] !== undefined ? `### ${inline(m[1])}` : inline(m[2]));
+            }
+            if (!out.length) throw new Error(`empty patch notes for ${v}`);
+            return `${out.join('\n')}\n\n**Download:** ${SITE}/download/ (the app updates itself)\n**All patch notes:** ${SITE}/changelog/\n`;
+          };
+
+          let release, list;
+          try {
+            [release, list] = await Promise.all([get('https://api.riptweaks.com/latest-app-release'), get(`${SITE}/changelog/`)]);
+          } catch (e) {
+            console.log(`::warning::riptweaks.com did not answer, next try in an hour: ${e.message}`);
+            process.exit(0);
+          }
+          const live = JSON.parse(release).appRelease.version;
+          const versions = [...new Set([...list.matchAll(/\/changelog\/rip\/(\d+(?:\.\d+)+)\//g)].map((m) => m[1]))];
+          if (!versions.length) throw new Error(`no versions on ${SITE}/changelog/`);
+
+          const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8' });
+          const released = new Set(JSON.parse(gh('release', 'list', '--limit', '500', '--json', 'tagName')).map((r) => r.tagName));
+          const todo = versions.filter((v) => cmp(v, FIRST) >= 0 && cmp(v, live) <= 0 && !released.has(`v${v}`)).sort(cmp);
+          for (const v of todo) {
+            writeFileSync('notes.md', notes(await get(`${SITE}/changelog/rip/${v}/`), v));
+            gh('release', 'create', `v${v}`, '--title', `RIP Tweaks ${v}`, '--notes-file', 'notes.md');
+            console.log(`Released RIP Tweaks ${v}`);
+          }
+          if (!todo.length) console.log(`Up to date: the app is on ${live}.`);
+          EOF
+
+      - name: Keep the hourly run on
+        # GitHub pauses scheduled runs in a repository that has had no commits for 60 days.
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/release-notes.yml/enable"
